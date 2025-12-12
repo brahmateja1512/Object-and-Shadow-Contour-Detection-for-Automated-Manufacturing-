@@ -1,211 +1,622 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import json
+import math
+import threading
+import queue
+import tempfile
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+from PIL import Image, ImageTk
+
 import cv2
 import numpy as np
 import ezdxf
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.affinity import translate
-import tkinter as tk
-from tkinter import messagebox
-from PIL import Image, ImageTk
-import os
+from shapely.ops import unary_union
 
-def offset_contour(contour, offset_distance, round_corners=False):
-    if len(contour) < 3:
-        return None
+def contour_to_numpy(contour):
+    arr = np.asarray(contour)
+    if arr.ndim == 3 and arr.shape[1] == 1:
+        arr = arr.reshape((-1, 2))
+    return arr.astype(float)
 
-    if not np.array_equal(contour[0], contour[-1]):
-        contour = np.vstack([contour, contour[0]])
+def ensure_closed_coords(coords):
+    if len(coords) == 0:
+        return coords
+    if np.allclose(coords[0], coords[-1]):
+        return coords
+    return np.vstack([coords, coords[0]])
 
-    poly = Polygon(contour)
+def offset_contour(contour, offset_distance, round_corners=False, simplify_tol=0.5, max_vertices=5000):
+    try:
+        pts = contour_to_numpy(contour)
+        if pts.shape[0] < 3:
+            return []
+        pts = ensure_closed_coords(pts)
+        poly = Polygon(pts)
+        if not poly.is_valid or poly.area == 0:
+            poly = Polygon(poly.exterior.coords)
+            if not poly.is_valid or poly.area == 0:
+                return []
 
-    if round_corners:
-        offset_poly = poly.buffer(offset_distance, resolution=2)
+        join_style = 1 if round_corners else 2
+        buf = poly.buffer(offset_distance, resolution=8, join_style=join_style)
+        if buf.is_empty:
+            return []
+
+        if isinstance(buf, MultiPolygon):
+            buf = unary_union(buf)
+
+        polys = []
+        geoms = [buf] if isinstance(buf, Polygon) else list(buf.geoms) if isinstance(buf, MultiPolygon) else []
+        for g in geoms:
+            try:
+                simp = g.simplify(simplify_tol, preserve_topology=True)
+            except Exception:
+                simp = g
+            if not isinstance(simp, Polygon):
+                continue
+            coords = np.array(simp.exterior.coords)
+            if coords.shape[0] > max_vertices:
+                coords = np.array(g.exterior.simplify(simplify_tol * 2.0).coords)
+            coords_int = np.round(coords).astype(np.int32)
+            if coords_int.shape[0] >= 3:
+                polys.append(coords_int)
+        return polys
+    except Exception as e:
+        print("offset_contour error:", e)
+        return []
+
+def find_contours_from_image(img_gray, method='canny', canny_thresh=(50,150), blur_ksize=5, thresh_val=None):
+    if blur_ksize % 2 == 0:
+        blur_ksize += 1
+    blurred = cv2.GaussianBlur(img_gray, (blur_ksize, blur_ksize), 0)
+    if method == 'canny':
+        edges = cv2.Canny(blurred, canny_thresh[0], canny_thresh[1])
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     else:
-        offset_poly = poly.buffer(offset_distance, join_style=2)
-
-    if isinstance(offset_poly, Polygon):
-        return np.array(offset_poly.exterior.coords, dtype=np.int32)
-    elif isinstance(offset_poly, MultiPolygon):
-        combined_coords = []
-        for p in offset_poly.geoms:
-            combined_coords.append(np.array(p.exterior.coords, dtype=np.int32))
-        return combined_coords
-    else:
-        return None
-
-def nest_contours(contours, canvas_width, canvas_height):
-    nested_contours = []
-    current_x, current_y = 0, 0
-    for contour in contours:
-        poly = Polygon(contour)
-        if current_x + poly.bounds[2] < canvas_width:
-            nested_contours.append(translate(poly, current_x, current_y))
-            current_x += poly.bounds[2] + 10
+        if thresh_val is None:
+            _, th = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
-            current_x = 0
-            current_y += poly.bounds[3] + 10
-            nested_contours.append(translate(poly, current_x, current_y))
-    return [np.array(poly.exterior.coords, dtype=np.int32) for poly in nested_contours]
+            _, th = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return contours
+
+def nest_contours(contours, canvas_width, canvas_height, spacing=10):
+    nested = []
+    x_cursor = 0
+    y_cursor = 0
+    row_height = 0
+    for cont in contours:
+        xs = cont[:,0]; ys = cont[:,1]
+        w = int(xs.max() - xs.min()); h = int(ys.max() - ys.min())
+        if w <= 0 or h <= 0:
+            continue
+        if x_cursor + w > canvas_width:
+            x_cursor = 0
+            y_cursor += row_height + spacing
+            row_height = 0
+        if y_cursor + h > canvas_height:
+            print("nest_contours: canvas full, stopping placement")
+            break
+        minx = xs.min(); miny = ys.min()
+        translated = cont.copy().astype(int)
+        translated[:,0] = translated[:,0] - minx + x_cursor
+        translated[:,1] = translated[:,1] - miny + y_cursor
+        nested.append(translated)
+        x_cursor += w + spacing
+        row_height = max(row_height, h)
+    return nested
+
+def save_polylines_to_dxf(polylines, dxf_path, layer_name="CONTOURS", close=True, scale_factor=1.0, units='MM'):
+    try:
+        doc = ezdxf.new(dxfversion='R2010')
+        msp = doc.modelspace()
+        try:
+            doc.units = ezdxf.units.MM if units.upper().startswith('M') else ezdxf.units.MM
+        except Exception:
+            pass
+        for pts in polylines:
+            if pts is None or len(pts) < 2:
+                continue
+            pts_f = [(float(x) * scale_factor, float(y) * scale_factor) for (x,y) in pts]
+            if close and (abs(pts_f[0][0] - pts_f[-1][0]) > 1e-6 or abs(pts_f[0][1] - pts_f[-1][1]) > 1e-6):
+                pts_f = pts_f + [pts_f[0]]
+            msp.add_lwpolyline(pts_f, close=close, dxfattribs={'layer': layer_name})
+        os.makedirs(os.path.dirname(dxf_path) or '.', exist_ok=True)
+        doc.saveas(dxf_path)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+class CameraThread(threading.Thread):
+    def __init__(self, camera_index, frame_queue, stop_event):
+        super().__init__(daemon=True)
+        self.camera_index = camera_index
+        self.frame_queue = frame_queue
+        self.stop_event = stop_event
+        self.cap = None
+
+    def run(self):
+        try:
+            self.cap = cv2.VideoCapture(self.camera_index)
+            if not self.cap.isOpened():
+                self.frame_queue.put(("error", f"Could not open camera index {self.camera_index}"))
+                return
+            while not self.stop_event.is_set():
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.frame_queue.put(("error", "Failed to read frame from camera"))
+                    break
+                if not self.frame_queue.empty():
+                    try:
+                        while not self.frame_queue.empty():
+                            self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                self.frame_queue.put(("frame", frame))
+                time.sleep(0.01)
+        finally:
+            if self.cap:
+                self.cap.release()
 
 class LamChallengeApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("LAM Challenge")
+        self.root.title("LAM Challenge - Contour to DXF (with calibration & presets)")
         self.root.configure(bg="#FFFFE0")
-        self.create_welcome_screen()
+        self.params = {
+            "offset": 0.0,
+            "round_corners": False,
+            "min_area": 200.0,
+            "method": "canny",
+            "canny_low": 50,
+            "canny_high": 150,
+            "blur": 5,
+            "simplify_tol": 1.0,
+            "nest_spacing": 10,
+            "canvas_w": 1000,
+            "canvas_h": 1000,
+            "mm_per_pixel": 1.0,
+            "output_dir": os.path.abspath("out"),
+            "camera_index": 0
+        }
+        self.presets_dir = os.path.join(os.path.expanduser("~"), ".lam_presets")
+        os.makedirs(self.presets_dir, exist_ok=True)
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.camera_stop_event = threading.Event()
+        self.camera_thread = None
+        self.preview_image_tk = None
+        self.selected_image_path = None
+        self.last_polylines = []
+        self.last_preview_np = None
+        self.build_ui()
+        self.refresh_presets_menu()
 
-    def create_welcome_screen(self):
-        self.clear_screen()
-        file_path = r"C:\Users\bharg\OneDrive\Desktop\Opencv\1234.png"
-        if not os.path.exists(file_path):
-            messagebox.showerror("Error", f"The file {file_path} does not exist.")
+    def build_ui(self):
+        top = tk.Frame(self.root, bg="#FFFFE0")
+        top.pack(fill=tk.X, padx=10, pady=8)
+        self.source_var = tk.StringVar(value="camera")
+        tk.Radiobutton(top, text="Camera", variable=self.source_var, value="camera", bg="#FFFFE0").pack(side=tk.LEFT, padx=6)
+        tk.Radiobutton(top, text="Image File", variable=self.source_var, value="file", bg="#FFFFE0").pack(side=tk.LEFT, padx=6)
+        tk.Button(top, text="Browse Image", command=self.browse_image, bg="#f0f0f0").pack(side=tk.LEFT, padx=8)
+        tk.Button(top, text="Select Output Folder", command=self.browse_output_dir, bg="#f0f0f0").pack(side=tk.LEFT, padx=8)
+        tk.Button(top, text="Calibrate...", command=self.calibrate_from_image, bg="#f0ad4e").pack(side=tk.LEFT, padx=8)
+        pframe = tk.LabelFrame(self.root, text="Parameters", bg="#FFFFE0")
+        pframe.pack(fill=tk.X, padx=10, pady=6)
+        tk.Label(pframe, text="Offset (pixels):", bg="#FFFFE0").grid(row=0, column=0, sticky='w', padx=6, pady=3)
+        self.offset_entry = tk.Entry(pframe, width=8); self.offset_entry.insert(0, str(self.params["offset"])); self.offset_entry.grid(row=0, column=1, padx=6)
+        self.round_var = tk.BooleanVar(value=self.params["round_corners"])
+        tk.Checkbutton(pframe, text="Round corners", variable=self.round_var, bg="#FFFFE0").grid(row=0, column=2, padx=6)
+        tk.Label(pframe, text="Min area (px):", bg="#FFFFE0").grid(row=1, column=0, sticky='w', padx=6)
+        self.min_area_entry = tk.Entry(pframe, width=8); self.min_area_entry.insert(0, str(self.params["min_area"])); self.min_area_entry.grid(row=1, column=1, padx=6)
+        tk.Label(pframe, text="Method:", bg="#FFFFE0").grid(row=1, column=2, sticky='w', padx=6)
+        self.method_var = tk.StringVar(value=self.params["method"]); tk.OptionMenu(pframe, self.method_var, "canny", "threshold").grid(row=1, column=3, padx=6)
+        tk.Label(pframe, text="Canny low/high:", bg="#FFFFE0").grid(row=2, column=0, sticky='w', padx=6)
+        self.canny_low_entry = tk.Entry(pframe, width=6); self.canny_low_entry.insert(0, str(self.params["canny_low"])); self.canny_low_entry.grid(row=2, column=1, sticky='w', padx=2)
+        self.canny_high_entry = tk.Entry(pframe, width=6); self.canny_high_entry.insert(0, str(self.params["canny_high"])); self.canny_high_entry.grid(row=2, column=1, sticky='e', padx=2)
+        tk.Label(pframe, text="Blur (odd):", bg="#FFFFE0").grid(row=2, column=2, sticky='w', padx=6)
+        self.blur_entry = tk.Entry(pframe, width=6); self.blur_entry.insert(0, str(self.params["blur"])); self.blur_entry.grid(row=2, column=3, padx=6)
+        tk.Label(pframe, text="Simplify tol (px):", bg="#FFFFE0").grid(row=3, column=0, sticky='w', padx=6)
+        self.simplify_entry = tk.Entry(pframe, width=8); self.simplify_entry.insert(0, str(self.params["simplify_tol"])); self.simplify_entry.grid(row=3, column=1, padx=6)
+        tk.Label(pframe, text="Scale (mm per px):", bg="#FFFFE0").grid(row=3, column=2, sticky='w', padx=6)
+        self.scale_entry = tk.Entry(pframe, width=8); self.scale_entry.insert(0, str(self.params["mm_per_pixel"])); self.scale_entry.grid(row=3, column=3, padx=6)
+        tk.Label(pframe, text="Nest canvas W x H:", bg="#FFFFE0").grid(row=4, column=0, sticky='w', padx=6)
+        self.canvas_w_entry = tk.Entry(pframe, width=6); self.canvas_w_entry.insert(0, str(self.params["canvas_w"])); self.canvas_w_entry.grid(row=4, column=1, sticky='w')
+        self.canvas_h_entry = tk.Entry(pframe, width=6); self.canvas_h_entry.insert(0, str(self.params["canvas_h"])); self.canvas_h_entry.grid(row=4, column=1, sticky='e')
+        tk.Label(pframe, text="Nest spacing (px):", bg="#FFFFE0").grid(row=4, column=2, sticky='w', padx=6)
+        self.nest_space_entry = tk.Entry(pframe, width=6); self.nest_space_entry.insert(0, str(self.params["nest_spacing"])); self.nest_space_entry.grid(row=4, column=3)
+        preset_frame = tk.Frame(self.root, bg="#FFFFE0")
+        preset_frame.pack(fill=tk.X, padx=10)
+        self.presets_var = tk.StringVar(value="")
+        tk.Label(preset_frame, text="Preset:", bg="#FFFFE0").pack(side=tk.LEFT, padx=6)
+        self.presets_menu = tk.OptionMenu(preset_frame, self.presets_var, ())
+        self.presets_menu.pack(side=tk.LEFT, padx=6)
+        tk.Button(preset_frame, text="Save Preset", command=self.save_current_preset).pack(side=tk.LEFT, padx=6)
+        tk.Button(preset_frame, text="Load Preset", command=self.load_selected_preset).pack(side=tk.LEFT, padx=6)
+        tk.Button(preset_frame, text="Delete Preset", command=self.delete_selected_preset).pack(side=tk.LEFT, padx=6)
+        self.out_label = tk.Label(self.root, text=f"Output folder: {self.params['output_dir']}", bg="#FFFFE0")
+        self.out_label.pack(fill=tk.X, padx=10, pady=4)
+        mid = tk.Frame(self.root, bg="#FFFFE0")
+        mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        left = tk.Frame(mid, bg="#FFFFE0"); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = tk.Frame(mid, bg="#FFFFE0"); right.pack(side=tk.RIGHT, fill=tk.Y)
+        self.preview_label = tk.Label(left, text="Preview will appear here", bg="#DDDDDD", width=60, height=20)
+        self.preview_label.pack(fill=tk.BOTH, expand=True)
+        tk.Button(right, text="Start / Process", command=self.on_start, width=18, bg="#4CAF50", fg="white").pack(pady=6)
+        tk.Button(right, text="Start Camera Thread", command=self.start_camera_thread, width=18, bg="#6aa84f", fg="white").pack(pady=6)
+        tk.Button(right, text="Stop Camera Thread", command=self.stop_camera_thread, width=18, bg="#f0ad4e", fg="white").pack(pady=6)
+        tk.Button(right, text="Save last as DXF", command=self.on_save_dxf, width=18, bg="#2196F3", fg="white").pack(pady=6)
+        tk.Button(right, text="Quit", command=self.on_quit, width=18, bg="#f44336", fg="white").pack(pady=6)
+
+    def preset_files(self):
+        return [f for f in os.listdir(self.presets_dir) if f.endswith(".json")]
+
+    def refresh_presets_menu(self):
+        menu = self.presets_menu["menu"]
+        menu.delete(0, "end")
+        files = self.preset_files()
+        if not files:
+            menu.add_command(label="(none)")
+            self.presets_var.set("")
+        else:
+            for f in files:
+                menu.add_command(label=f, command=lambda v=f: self.presets_var.set(v))
+            self.presets_var.set(files[0])
+
+    def save_current_preset(self):
+        name = simpledialog.askstring("Preset name", "Enter a name for this preset (no extension):", parent=self.root)
+        if not name:
             return
+        self.read_params()
+        preset_path = os.path.join(self.presets_dir, name + ".json")
+        with open(preset_path, "w") as fh:
+            json.dump(self.params, fh, indent=2)
+        messagebox.showinfo("Preset saved", f"Saved to {preset_path}")
+        self.refresh_presets_menu()
 
-        self.logo_image = Image.open(file_path)
-        self.logo_photo = ImageTk.PhotoImage(self.logo_image)
-
-        logo_label = tk.Label(self.root, image=self.logo_photo, bg="#FFFFE0")
-        logo_label.image = self.logo_photo
-        logo_label.pack(pady=20)
-
-        title_label = tk.Label(self.root, text="LAM Challenge", font=("Helvetica", 40), bg="#FFFFE0", fg="black")
-        title_label.pack(pady=20)
-
-        start_button = tk.Button(self.root, text="Start", font=("Helvetica", 24), command=self.show_input_page, bg="green", fg="white")
-        start_button.pack(pady=20)
-
-    def show_input_page(self):
-        self.clear_screen()
-
-        frame = tk.Frame(self.root, bg="#FFFFE0")
-        frame.pack(expand=True)
-
-        label1 = tk.Label(frame, text="Enter offset distance for manufacturing tolerances (positive or negative):", font=("Helvetica", 16), bg="#FFFFE0")
-        label1.pack(pady=5)
-        self.offset_entry = tk.Entry(frame, font=("Helvetica", 16))
-        self.offset_entry.pack(pady=5)
-
-        label2 = tk.Label(frame, text="Do you want to round sharp corners? (y/n):", font=("Helvetica", 16), bg="#FFFFE0")
-        label2.pack(pady=5)
-        self.round_entry = tk.Entry(frame, font=("Helvetica", 16))
-        self.round_entry.pack(pady=5)
-
-        submit_button = tk.Button(frame, text="Submit", font=("Helvetica", 16), command=self.start_camera, bg="blue", fg="white")
-        submit_button.pack(pady=20)
-
-    def start_camera(self):
+    def load_selected_preset(self):
+        sel = self.presets_var.get()
+        if not sel:
+            messagebox.showerror("No preset", "No preset selected")
+            return
+        path = os.path.join(self.presets_dir, sel)
         try:
-            self.offset_distance = float(self.offset_entry.get())
-        except ValueError:
-            messagebox.showerror("Error", "Please enter a valid number for offset distance.")
+            with open(path, "r") as fh:
+                data = json.load(fh)
+            self.params.update(data)
+            self.offset_entry.delete(0, tk.END); self.offset_entry.insert(0, str(self.params["offset"]))
+            self.round_var.set(self.params.get("round_corners", False))
+            self.min_area_entry.delete(0, tk.END); self.min_area_entry.insert(0, str(self.params["min_area"]))
+            self.method_var.set(self.params.get("method", "canny"))
+            self.canny_low_entry.delete(0, tk.END); self.canny_low_entry.insert(0, str(self.params.get("canny_low",50)))
+            self.canny_high_entry.delete(0, tk.END); self.canny_high_entry.insert(0, str(self.params.get("canny_high",150)))
+            self.blur_entry.delete(0, tk.END); self.blur_entry.insert(0, str(self.params.get("blur",5)))
+            self.simplify_entry.delete(0, tk.END); self.simplify_entry.insert(0, str(self.params.get("simplify_tol",1.0)))
+            self.scale_entry.delete(0, tk.END); self.scale_entry.insert(0, str(self.params.get("mm_per_pixel",1.0)))
+            self.canvas_w_entry.delete(0, tk.END); self.canvas_w_entry.insert(0, str(self.params.get("canvas_w",1000)))
+            self.canvas_h_entry.delete(0, tk.END); self.canvas_h_entry.insert(0, str(self.params.get("canvas_h",1000)))
+            self.nest_space_entry.delete(0, tk.END); self.nest_space_entry.insert(0, str(self.params.get("nest_spacing",10)))
+            self.params['output_dir'] = data.get('output_dir', self.params['output_dir'])
+            self.out_label.config(text=f"Output folder: {self.params['output_dir']}")
+            messagebox.showinfo("Preset loaded", f"Loaded preset: {sel}")
+        except Exception as e:
+            messagebox.showerror("Load error", f"Failed to load preset: {e}")
+
+    def delete_selected_preset(self):
+        sel = self.presets_var.get()
+        if not sel:
+            messagebox.showerror("No preset", "No preset selected")
             return
-        
-        round_input = self.round_entry.get().strip().lower()
-        self.round_corners = (round_input == 'y')
+        path = os.path.join(self.presets_dir, sel)
+        try:
+            os.remove(path)
+            messagebox.showinfo("Deleted", f"Deleted preset {sel}")
+            self.refresh_presets_menu()
+        except Exception as e:
+            messagebox.showerror("Delete error", str(e))
 
-        self.clear_screen()
-        label = tk.Label(self.root, text="Camera is on. Press 5 to capture the image and q to close.", font=("Helvetica", 16), bg="#FFFFE0")
-        label.pack(pady=20)
-        self.run_camera()
-
-    def run_camera(self):
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            messagebox.showerror("Error", "Could not open camera")
+    def calibrate_from_image(self):
+        img_path = filedialog.askopenfilename(title="Select calibration image (with known-length object)",
+                                              filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")])
+        if not img_path:
             return
+        img = cv2.imread(img_path)
+        if img is None:
+            messagebox.showerror("Error", "Failed to read image")
+            return
+        top = tk.Toplevel(self.root)
+        top.title("Calibration - click two points across known length")
+        disp = img.copy()
+        im = Image.fromarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+        im.thumbnail((900, 700), Image.ANTIALIAS)
+        tk_img = ImageTk.PhotoImage(im)
+        lbl = tk.Label(top, image=tk_img)
+        lbl.image = tk_img
+        lbl.pack()
+        coords = []
+        def on_click(event):
+            widget_w = lbl.winfo_width(); widget_h = lbl.winfo_height()
+            img_w, img_h = im.size
+            sx = disp.shape[1] / img_w
+            sy = disp.shape[0] / img_h
+            x = int(event.x * sx)
+            y = int(event.y * sy)
+            coords.append((x,y))
+            if len(coords) >= 2:
+                lbl.unbind("<Button-1>")
+                top.update()
+                known_mm = simpledialog.askfloat("Known length", "Enter the known distance (in mm) between the two points you clicked:", parent=top)
+                if known_mm is None or known_mm <= 0:
+                    messagebox.showerror("Invalid", "Known length must be a positive number")
+                    top.destroy()
+                    return
+                p1, p2 = coords[0], coords[1]
+                px_dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                if px_dist <= 0:
+                    messagebox.showerror("Error", "Pixel distance measured zero; try again")
+                    top.destroy()
+                    return
+                mm_per_pixel = known_mm / px_dist
+                self.scale_entry.delete(0, tk.END); self.scale_entry.insert(0, str(mm_per_pixel))
+                self.params['mm_per_pixel'] = mm_per_pixel
+                messagebox.showinfo("Calibrated", f"Calibration complete: {mm_per_pixel:.6f} mm/pixel")
+                top.destroy()
+        lbl.bind("<Button-1>", on_click)
 
-        image_counter = 1
-        canvas_width, canvas_height = 1000, 1000
-        last_frame = None
+    def start_camera_thread(self):
+        if self.camera_thread and self.camera_thread.is_alive():
+            messagebox.showinfo("Camera", "Camera thread already running")
+            return
+        self.camera_stop_event.clear()
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.camera_thread = CameraThread(int(self.params.get("camera_index", 0)), self.frame_queue, self.camera_stop_event)
+        self.camera_thread.start()
+        self.root.after(50, self._update_from_camera_queue)
+        messagebox.showinfo("Camera", "Camera thread started; preview updates in the app preview.")
 
-        while True:
-            ret, frame = cap.read()
-            if ret:
-                frame = cv2.resize(frame, (640, 480))
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-                edges = cv2.Canny(blurred, 50, 100)
-                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def stop_camera_thread(self):
+        if self.camera_thread and self.camera_thread.is_alive():
+            self.camera_stop_event.set()
+            self.camera_thread.join(timeout=1.0)
+            messagebox.showinfo("Camera", "Camera thread stopped")
+        else:
+            messagebox.showinfo("Camera", "No camera thread running")
 
-                optimized_contours = []
-                for contour in contours:
-                    if cv2.contourArea(contour) < 50:
-                        continue
-                    offset_contour_result = offset_contour(contour[:, 0, :], self.offset_distance, self.round_corners)
-                    if offset_contour_result is not None:
-                        if isinstance(offset_contour_result, list):
-                            optimized_contours.extend(offset_contour_result)
-                        else:
-                            optimized_contours.append(offset_contour_result)
+    def _update_from_camera_queue(self):
+        try:
+            while not self.frame_queue.empty():
+                typ, data = self.frame_queue.get_nowait()
+                if typ == "error":
+                    messagebox.showerror("Camera error", data)
+                    return
+                if typ == "frame":
+                    frame = data
+                    self.last_camera_frame = frame.copy()
+                    disp = cv2.resize(frame, (640, 480))
+                    self.show_preview_image(disp)
+        except queue.Empty:
+            pass
+        if self.camera_thread and self.camera_thread.is_alive():
+            self.root.after(50, self._update_from_camera_queue)
 
-                nested_contours = nest_contours(optimized_contours, canvas_width, canvas_height)
-                nested_canvas = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
-                for contour in nested_contours:
-                    cv2.drawContours(nested_canvas, [contour], -1, 255, thickness=1)
+    def browse_image(self):
+        p = filedialog.askopenfilename(title="Select image file", filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")])
+        if p:
+            self.selected_image_path = p
+            self.source_var.set("file")
+            self.show_preview_text(f"Selected: {os.path.basename(p)}")
 
-                cv2.imshow('Camera Feed - Press 5 to Capture or q to Exit', nested_canvas)
-                key = cv2.waitKey(1) & 0xFF
+    def browse_output_dir(self):
+        d = filedialog.askdirectory(title="Select output directory")
+        if d:
+            self.params['output_dir'] = d
+            self.out_label.config(text=f"Output folder: {d}")
 
-                if key == ord('5'):
-                    last_frame = frame.copy()
-                    dxf_filename = f"contour_image_{image_counter}.dxf"
-                    doc = ezdxf.new(dxfversion='R2010')
-                    msp = doc.modelspace()
-                    for contour in nested_contours:
-                        points = [(point[0], point[1]) for point in contour]
-                        msp.add_lwpolyline(points)
-                    doc.saveas(dxf_filename)
-                    print(f"DXF file saved as {dxf_filename}")
-                    image_counter += 1
-                    self.show_capture_confirmation(last_frame)
-
-                if key == ord('q'):
-                    break
+    def show_preview_image(self, np_img):
+        try:
+            if np_img is None:
+                self.preview_label.config(image='', text="No preview")
+                return
+            if np_img.ndim == 2:
+                im = Image.fromarray(np_img).convert("RGB")
             else:
-                print("Error: Failed to capture frame")
-                break
+                im = Image.fromarray(cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB))
+            im.thumbnail((900, 700), Image.ANTIALIAS)
+            self.preview_image_tk = ImageTk.PhotoImage(im)
+            self.preview_label.config(image=self.preview_image_tk, text="")
+        except Exception as e:
+            print("show_preview_image error:", e)
+            self.preview_label.config(text="Preview error")
 
+    def show_preview_text(self, text):
+        self.preview_label.config(image='', text=text)
+
+    def read_params(self):
+        try:
+            offset = float(self.offset_entry.get())
+        except Exception:
+            offset = 0.0
+        round_corners = bool(self.round_var.get())
+        try:
+            min_area = float(self.min_area_entry.get())
+        except Exception:
+            min_area = 200.0
+        method = self.method_var.get()
+        try:
+            canny_low = int(self.canny_low_entry.get()); canny_high = int(self.canny_high_entry.get())
+        except Exception:
+            canny_low, canny_high = 50, 150
+        try:
+            blur = int(self.blur_entry.get()); blur = blur + 1 if blur % 2 == 0 else blur
+        except Exception:
+            blur = 5
+        try:
+            simplify_tol = float(self.simplify_entry.get())
+        except Exception:
+            simplify_tol = 1.0
+        try:
+            mm_per_pixel = float(self.scale_entry.get())
+        except Exception:
+            mm_per_pixel = 1.0
+        try:
+            canvas_w = int(self.canvas_w_entry.get()); canvas_h = int(self.canvas_h_entry.get())
+        except Exception:
+            canvas_w, canvas_h = 1000, 1000
+        try:
+            nest_spacing = int(self.nest_space_entry.get())
+        except Exception:
+            nest_spacing = 10
+        self.params.update({
+            "offset": offset, "round_corners": round_corners, "min_area": min_area,
+            "method": method, "canny_low": canny_low, "canny_high": canny_high,
+            "blur": blur, "simplify_tol": simplify_tol, "mm_per_pixel": mm_per_pixel,
+            "canvas_w": canvas_w, "canvas_h": canvas_h, "nest_spacing": nest_spacing
+        })
+
+    def on_start(self):
+        self.read_params()
+        source = self.source_var.get()
+        if source == "file":
+            if not self.selected_image_path or not os.path.exists(self.selected_image_path):
+                messagebox.showerror("Error", "No valid image selected")
+                return
+            self.process_image_file(self.selected_image_path)
+        else:
+            if hasattr(self, "last_camera_frame"):
+                gray = cv2.cvtColor(self.last_camera_frame, cv2.COLOR_BGR2GRAY)
+                self._process_and_preview(gray, orig_color=self.last_camera_frame)
+            else:
+                self.run_one_camera_capture()
+
+    def run_one_camera_capture(self):
+        cam_idx = int(self.params.get("camera_index", 0))
+        cap = cv2.VideoCapture(cam_idx)
+        if not cap.isOpened():
+            messagebox.showerror("Error", f"Could not open camera {cam_idx}")
+            return
+        ret, frame = cap.read()
         cap.release()
-        cv2.destroyAllWindows()
+        if not ret:
+            messagebox.showerror("Error", "Failed to capture from camera")
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._process_and_preview(gray, orig_color=frame)
 
-    def show_capture_confirmation(self, last_frame):
-        self.clear_screen()
+    def process_image_file(self, path):
+        try:
+            img = cv2.imread(path)
+            if img is None:
+                messagebox.showerror("Error", "Failed to read image")
+                return
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            self._process_and_preview(gray, orig_color=img)
+        except Exception as e:
+            messagebox.showerror("Error", f"Processing image failed: {e}")
 
-        captured_image = Image.fromarray(cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB))
-        captured_photo = ImageTk.PhotoImage(captured_image)
+    def _process_and_preview(self, gray_img, orig_color=None):
+        try:
+            method = self.params["method"]
+            contours = find_contours_from_image(gray_img,
+                                               method=method,
+                                               canny_thresh=(self.params["canny_low"], self.params["canny_high"]),
+                                               blur_ksize=self.params["blur"])
+            filtered = []
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < self.params["min_area"]:
+                    continue
+                filtered.append(c)
+            all_polys = []
+            for c in filtered:
+                c_np = contour_to_numpy(c)
+                result_polys = offset_contour(c_np,
+                                             offset_distance=self.params["offset"],
+                                             round_corners=self.params["round_corners"],
+                                             simplify_tol=self.params["simplify_tol"])
+                if result_polys:
+                    all_polys.extend(result_polys)
+            if not all_polys:
+                messagebox.showwarning("No contours", "No valid contours were produced after offsetting.")
+                self.last_polylines = []
+                self.show_preview_text("No contours found")
+                return
+            nested = nest_contours(all_polys, self.params["canvas_w"], self.params["canvas_h"], spacing=self.params["nest_spacing"])
+            if not nested:
+                messagebox.showwarning("Nesting", "No contours could be nested into the canvas (canvas might be too small).")
+                self.last_polylines = []
+                self.show_preview_text("Nesting failed")
+                return
+            canvas = np.zeros((self.params["canvas_h"], self.params["canvas_w"], 3), dtype=np.uint8)
+            for poly in nested:
+                pts = poly.reshape(-1,1,2)
+                cv2.drawContours(canvas, [pts], -1, (0,255,0), thickness=1)
+            if orig_color is not None:
+                try:
+                    thumb = orig_color.copy()
+                    h,w = thumb.shape[:2]
+                    max_thumb_w = min(200, canvas.shape[1]//3)
+                    scale_factor = max_thumb_w / float(w)
+                    new_w = int(w * scale_factor); new_h = int(h * scale_factor)
+                    thumb_small = cv2.resize(thumb, (new_w,new_h))
+                    canvas[0:new_h, 0:new_w] = thumb_small
+                except Exception:
+                    pass
+            self.last_polylines = nested
+            self.last_preview_np = canvas
+            self.show_preview_image(canvas)
+            messagebox.showinfo("Done", f"Processing done. {len(nested)} polylines ready for DXF export.")
+        except Exception as e:
+            messagebox.showerror("Processing error", f"An error occurred during processing: {e}")
 
-        frame = tk.Frame(self.root, bg="#FFFFE0")
-        frame.pack(expand=True)
+    def on_save_dxf(self):
+        if not self.last_polylines:
+            messagebox.showerror("No data", "No polylines available to save. Run processing first.")
+            return
+        out_dir = self.params.get("output_dir", os.path.abspath("out"))
+        os.makedirs(out_dir, exist_ok=True)
+        fname = os.path.join(out_dir, f"contours_{int(time.time())}.dxf")
+        scale_factor = float(self.params.get("mm_per_pixel", 1.0))
+        ok, err = save_polylines_to_dxf(self.last_polylines, fname, layer_name="CONTOURS", close=True, scale_factor=scale_factor)
+        if ok:
+            messagebox.showinfo("Saved", f"DXF saved to:\n{fname}")
+        else:
+            messagebox.showerror("Save error", f"Failed to save DXF: {err}")
 
-        image_label = tk.Label(frame, image=captured_photo, bg="#FFFFE0")
-        image_label.image = captured_photo
-        image_label.pack(pady=20)
+    def on_quit(self):
+        self.stop_camera_thread()
+        self.root.quit()
 
-        label = tk.Label(frame, text="Image has been saved and converted into DXF format.", font=("Helvetica", 16), bg="#FFFFE0")
-        label.pack(pady=20)
-
-        capture_again_button = tk.Button(frame, text="Capture Again", command=self.start_camera, font=("Helvetica", 16), bg="blue", fg="white")
-        capture_again_button.pack(side=tk.LEFT, padx=10, pady=20)
-        close_button = tk.Button(frame, text="Close", command=self.show_thank_you_message, font=("Helvetica", 16), bg="red", fg="white")
-        close_button.pack(side=tk.RIGHT, padx=10, pady=20)
-
-    def show_thank_you_message(self):
-        self.clear_screen()
-
-        frame = tk.Frame(self.root, bg="#FFFFE0")
-        frame.pack(expand=True)
-
-        thank_you_label = tk.Label(frame, text="Thank you, regards Chinmaye and team", font=("Helvetica", 24), bg="#FFFFE0", fg="black")
-        thank_you_label.pack(pady=20)
-
-        close_button = tk.Button(frame, text="Close", command=self.root.quit, font=("Helvetica", 16), bg="red", fg="white")
-        close_button.pack(pady=20)
-
-    def clear_screen(self):
-        for widget in self.root.winfo_children():
-            widget.destroy()
-
-if __name__ == "__main__":
+def main():
+    missing = []
+    try:
+        import ezdxf
+    except Exception:
+        missing.append("ezdxf")
+    try:
+        import shapely
+    except Exception:
+        missing.append("shapely")
+    try:
+        import PIL
+    except Exception:
+        missing.append("Pillow")
+    if missing:
+        msg = f"Missing packages: {', '.join(missing)}.\nInstall with:\n pip install -r requirements.txt"
+        print(msg)
+        root = tk.Tk(); root.withdraw()
+        messagebox.showerror("Missing dependencies", msg)
+        return
     root = tk.Tk()
-    root.geometry("800x600")
+    root.geometry("1100x750")
     app = LamChallengeApp(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
